@@ -4,14 +4,14 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import Header from "@/app/chat/_components/Header";
 import ChatForm from "@/app/chat/_components/ChatForm";
 import ChatMessage from "@/app/chat/_components/ChatMessage";
-import { socket, getSocket } from "@/lib/socketClient";
+import { socket } from "@/lib/socketClient";
 import { shouldShowTimestampHeader, getTimestampHeader } from "@/utils/timeUtils";
-import { MessageType } from "@/app/chat/types/chat";
+import { ChatUser, MessageType, ApiMessageResponse } from "@/app/chat/types/chat";
 
 const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
   const [chatid, setChatid] = useState<string>("");
-  const [user, setUser] = useState<{ id: string; name: string; image?: string } | null>(null);
-  const [currentUser, setCurrentUser] = useState<{ id: string; name: string; image?: string } | null>(null);
+  const [user, setUser] = useState<ChatUser | null>(null);
+  const [currentUser, setCurrentUser] = useState<ChatUser | null>(null);
   const [messages, setMessages] = useState<MessageType[]>([]);
   const [hasMore, setHasMore] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -23,7 +23,6 @@ const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
 
   const room = user && currentUser ? `dm:${[user.name, currentUser.name].sort().join("-")}` : "";
 
-
   const scrollToBottom = (smooth = false) => {
     if (smooth) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -32,7 +31,14 @@ const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
     }
   };
 
-  // Resolve route param
+  // Helper function to ensure socket connection
+  const getSocket = () => {
+    if (!socket.connected) {
+      socket.connect();
+    }
+    return socket;
+  };
+
   useEffect(() => {
     const resolveParams = async () => {
       const resolved = await params;
@@ -41,7 +47,6 @@ const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
     resolveParams();
   }, [params]);
 
-  // Fetch current user
   useEffect(() => {
     const fetchCurrentUser = async () => {
       const res = await fetch("/api/me");
@@ -75,7 +80,7 @@ const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
     if (before) url.searchParams.append("before", before);
 
     const res = await fetch(url.toString());
-    const data = await res.json();
+    const data: ApiMessageResponse[] = await res.json();
 
     if (!Array.isArray(data) || data.length === 0) {
       setHasMore(false);
@@ -83,8 +88,8 @@ const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
       return;
     }
 
-    const formatted: MessageType[] = data.map((msg: { sender_id: string; message: string; created_at: string }) => ({
-      sender: msg.sender_id === currentUser!.id ? currentUser!.name : user!.name,
+    const formatted: MessageType[] = data.map((msg: ApiMessageResponse) => ({
+      sender: msg.sender_id === currentUser.id ? currentUser.name! : user.name!,
       message: msg.message,
       created_at: msg.created_at,
     }));
@@ -92,7 +97,13 @@ const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
     const scroll = chatContainerRef.current;
     const prevHeight = scroll?.scrollHeight ?? 0;
 
-    setMessages((prev) => [...formatted.reverse(), ...prev]);
+    if (before) {
+      // For pagination: prepend older messages
+      setMessages((prev) => [...formatted, ...prev]);
+    } else {
+      // For initial load: set all messages
+      setMessages(formatted);
+    }
 
     requestAnimationFrame(() => {
       if (scroll && before) {
@@ -102,7 +113,7 @@ const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
     });
 
     setLoadingOlder(false);
-  }, [room, currentUser, user, loadingOlder, setHasMore, setLoadingOlder, setMessages, chatContainerRef]);
+  }, [room, currentUser, user, loadingOlder]);
 
   useEffect(() => {
     const container = chatContainerRef.current;
@@ -116,7 +127,6 @@ const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
     return () => container?.removeEventListener("scroll", onScroll);
   }, [messages, hasMore, loadingOlder, fetchMessages]);
 
-  // Initial message load
   useEffect(() => {
     if (room && currentUser && user && !firstRenderDone) {
       fetchMessages().then(() => {
@@ -128,11 +138,13 @@ const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
     }
   }, [room, currentUser, user, firstRenderDone, fetchMessages]);
 
-
+  // Socket connection and message handling
   useEffect(() => {
     if (!room || !currentUser || !user || joined) return;
     
     try {
+      console.log("🔌 Attempting to join room:", room, "as:", currentUser.name);
+      
       // Make sure socket is connected first
       getSocket();
       
@@ -140,28 +152,56 @@ const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
       setJoined(true);
 
       const onMessage = (data: unknown) => {
+        console.log("📨 Received socket message:", data);
+        
         // Cast data to the expected type with type checking
         const messageData = data as { sender: string; message: string; created_at?: string };
         
         if (typeof messageData?.sender === 'string' && 
-            typeof messageData?.message === 'string' && 
-            messageData.sender !== currentUser.name) {
+            typeof messageData?.message === 'string') {
           
-          const newMessage: MessageType = {
-            sender: messageData.sender,
-            message: messageData.message,
-            created_at: messageData.created_at || new Date().toISOString(),
-          };
-          setMessages((prev) => [...prev, newMessage]);
-          // Smooth scroll for incoming messages
-          requestAnimationFrame(() => scrollToBottom(true));
+          console.log("✅ Valid message from:", messageData.sender, "current user:", currentUser.name);
+          
+          // Only add to state if it's NOT from current user (to avoid duplicates)
+          if (messageData.sender !== currentUser.name) {
+            const newMessage: MessageType = {
+              sender: messageData.sender,
+              message: messageData.message,
+              created_at: messageData.created_at || new Date().toISOString(),
+            };
+            
+            console.log("➕ Adding message to state:", newMessage);
+            setMessages((prev) => [...prev, newMessage]);
+            
+            // Smooth scroll for incoming messages
+            requestAnimationFrame(() => scrollToBottom(true));
+          } else {
+            console.log("🚫 Ignoring own message via socket");
+          }
+        } else {
+          console.log("❌ Invalid message format:", messageData);
         }
       };
 
+      const onConnect = () => {
+        console.log("🟢 Socket connected");
+      };
+      
+      const onDisconnect = () => {
+        console.log("🔴 Socket disconnected");
+      };
+
       socket.on("message", onMessage);
-      return () => { socket.off("message", onMessage); };
+      socket.on("connect", onConnect);
+      socket.on("disconnect", onDisconnect);
+      
+      return () => { 
+        socket.off("message", onMessage);
+        socket.off("connect", onConnect);
+        socket.off("disconnect", onDisconnect);
+      };
     } catch (err) {
-      console.warn("Chat socket connection unavailable:", err);
+      console.warn("❌ Chat socket connection unavailable:", err);
     }
   }, [room, currentUser, user, joined]);
 
@@ -170,37 +210,56 @@ const Page = ({ params }: { params: Promise<{ chatid: string }> }) => {
 
     const timestamp = new Date().toISOString();
     const msgData: MessageType = {
-      sender: currentUser.name,
+      sender: currentUser.name || currentUser.id,
       message,
       created_at: timestamp,
     };
 
+    console.log("📤 Sending message:", msgData, "to room:", room);
+    
+    // Add message to local state immediately (for sender)
     setMessages((prev) => [...prev, msgData]);
+    
+    // Emit to socket (will be received by other users in the room)
     socket.emit("message", { ...msgData, room });
-    // Smooth scroll for sent messages
+    
     requestAnimationFrame(() => scrollToBottom(true));
 
-    await fetch("/api/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sender_id: currentUser.id,
-        receiver_id: user.id,
-        room,
-        message,
-      }),
-    });
+    // Save to database
+    try {
+      const response = await fetch("/api/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sender_id: currentUser.id,
+          receiver_id: user.id,
+          room,
+          message,
+        }),
+      });
+      
+      if (!response.ok) {
+        console.error("❌ Failed to save message to database");
+      }
+    } catch (err) {
+      console.error("❌ Error saving message:", err);
+    }
   };
 
   if (!user || !chatid || !currentUser) return <div>Loading...</div>;
 
   return (
     <div className="flex flex-col h-full">
-      <Header imageUrl={user.image} name={user.name} />
+      <Header imageUrl={user.image} name={user.name?? user.id} />
       <div
         ref={chatContainerRef}
         className="flex-1 overflow-y-auto bg-gray-200 p-4 mb-2 border rounded-lg"
       >
+        {loadingOlder && (
+          <div className="flex justify-center py-2">
+            <div className="text-gray-500 text-sm">Loading older messages...</div>
+          </div>
+        )}
         {messages.map((msg, i) => (
           <div key={i}>
             {/* Timestamp Header */}
